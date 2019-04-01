@@ -1,7 +1,11 @@
 import express from 'express'
 import { register, Counter } from 'prom-client'
 
-export default class PrometheusExtension {
+function joinPath (path) {
+   return path.prev === undefined ? path.key : `${joinPath(path.prev)}.${path.key}`
+}
+
+export default class GraphQLPrometheus {
   constructor(port = 9000) {
     const server = express()
     server.get('/metrics', (req, res) => {
@@ -14,13 +18,49 @@ export default class PrometheusExtension {
       requests: new Counter({
         name: 'graphql_requests_total',
         help: 'Total count of graphql requests',
-        labelNames: ['error']
+        labelNames: ['error', 'operation_name']
+      }),
+      nodes: new Counter({
+        name: 'graphql_request_path_total',
+        help: 'Total count of graphql requests, by query path',
+        labelNames: ['error', 'node', 'error_node']
       })
     }
-
   }
 
-  requestDidStart(o) {
-    this.counters.requests.inc({ error: false })
+  extension() {
+    return new PrometheusExtension(this.counters)
+  }
+}
+
+export class PrometheusExtension {
+  constructor(counters) {
+    this.counters = counters
+
+    this.nodes = {}
+  }
+
+  requestDidStart({ parsedQuery, operationName }) {
+    this.operationName = operationName
+  }
+
+  willResolveField(source, args, context, info) {
+    this.nodes[joinPath(info.path)] = `${info.parentType}.${info.path.key}`
+  }
+
+  willSendResponse({ graphqlResponse, context }) {
+    // global request metric
+    const labels = { error: !!graphqlResponse.errors }
+    if (this.operationName) {
+      labels.operation_name = this.operationName
+    }
+    this.counters.requests.inc(labels)
+
+    // individual node metrics
+    const errorPaths = graphqlResponse.errors ? graphqlResponse.errors.map(err => err.path.join('.')) : []
+    Object.entries(this.nodes).map(([path, key]) => this.counters.nodes.inc({
+      node: key,
+      error: errorPaths.includes(path)
+    }))
   }
 }
